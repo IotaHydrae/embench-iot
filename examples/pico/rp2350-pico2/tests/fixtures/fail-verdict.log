@@ -1,0 +1,3 @@
+PICO-TURBO: 520000 kHz asked, 520000 kHz configured, 520000 kHz measured, vreg sel 19, flash 52000 kHz, clk_peri 520000 kHz, usb ok
+EMBENCH: crc32 scale 100 heat 1
+EMBENCH-PICO: crc32 123456 us FAIL
