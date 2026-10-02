@@ -2,20 +2,22 @@
 """One Embench benchmark, on the board, with pico-turbo owning the clock.
 
     run.py --benchmark statemate
-    run.py --benchmark matmult-int --khz 150000
+    run.py --benchmark matmult-int --khz 150000 --scale 100
     run.py --benchmark statemate --toolchain /path/to/toolchain/usr
 
 The flash path, the read-back comparison and the console reader are the coremark
-repository's, imported rather than copied: erasing through the bootrom, writing
-with picotool, comparing the flash against the build byte for byte, and holding
-the CDC port open before the application starts are the parts of this bench that
-were learned the hard way, and two copies of them would drift.
+repository's, imported rather than copied: blanking the flash through the debugger
+(which brings the bootrom's USB up), writing with picotool through the bootrom,
+reading the image back over SWD, comparing it with the build byte for byte, and
+holding the CDC port open before the application starts are the parts of that bench
+that were learned the hard way, and two copies of them would drift.  The state
+line's grammar comes from coremark too (`tools/probe_parse.py`), for the same reason.
 
 What this adds is the benchmark and the shape of the result.  Embench's own
-reference runner drives a GDB session and breaks on start_trigger and stop_trigger
-to read a cycle counter out of a register; this bench does not use a debugger
-during a run -- a halt costs the round its timing -- so the application prints its
-own line and this reads it:
+reference flow drives a GDB session and breaks on start_trigger and stop_trigger to
+read a cycle counter out of a register; this bench does not use a debugger during a
+run -- a halt costs the round its timing -- so the application prints its own line
+and this reads it:
 
     EMBENCH-PICO: <benchmark> <microseconds> us <pass|FAIL>
 
@@ -30,21 +32,13 @@ import subprocess
 import sys
 import time
 
+import embench_log
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 EMBENCH_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 
 
-def coremark_dir():
-    """Where the coremark checkout is, so its debugger path can be imported.  Not
-    written down: COREMARK_DIR, then a sibling directory called coremark."""
-    for cand in (os.environ.get("COREMARK_DIR"),
-                 os.path.join(os.path.dirname(EMBENCH_ROOT), "coremark")):
-        if cand and os.path.exists(os.path.join(cand, "tools", "probe.py")):
-            return os.path.abspath(cand)
-    return None
-
-
-def main():
+def arg_parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--benchmark", required=True,
                     help="a directory under src/, e.g. statemate")
@@ -61,11 +55,49 @@ def main():
                     or os.path.join(os.path.dirname(EMBENCH_ROOT), "pico-turbo"))
     ap.add_argument("--out", default=None)
     ap.add_argument("--keep", action="store_true", help="do not rebuild")
-    args = ap.parse_args()
+    return ap
 
-    cm = coremark_dir()
+
+def configure_cmd(args, source_dir, build_dir):
+    """The cmake configure command.
+
+    Kept as a function of `args` so a test can check that `--scale` and
+    `--benchmark` actually reach the build (CMakeLists.txt reads
+    `GLOBAL_SCALE_FACTOR` and `EMBENCH_BENCHMARK`), rather than trusting the
+    mapping by reading it.
+    """
+    return ["cmake", "-S", source_dir, "-B", build_dir,
+            "-DPICO_BOARD=%s" % args.board,
+            "-DPICO_TURBO_DIR=%s" % args.pico_turbo,
+            "-DPICO_TURBO_SYS_CLK_KHZ=%d" % args.khz,
+            "-DEMBENCH_BENCHMARK=%s" % args.benchmark,
+            "-DGLOBAL_SCALE_FACTOR=%d" % args.scale]
+
+
+def outcome(log):
+    """The runner's verdict on a parsed console log: `(kind, exit code)`.
+
+    A result line is also the line that says the run finished, so a state line
+    with no result means the run started and stopped inside itself (`stuck`); no
+    state line at all means nothing ran.  Only the application's own `pass` is a
+    pass.  The clock rule -- the state line's hardware-measured clock must equal
+    the requested one -- is not applied here; it is checked separately
+    (embench_log.clock_landed, tests/test_run_validity.py) because a run can
+    finish with a correct checksum at the wrong clock, and that result must not
+    be quoted.
+    """
+    if log.result is None:
+        return ("stuck" if log.state else "no-output"), 1
+    return ("passed", 0) if log.result.verdict == "pass" else ("failed", 1)
+
+
+def main():
+    args = arg_parser().parse_args()
+
+    cm = embench_log.coremark_dir()
     if not cm:
-        sys.exit("no coremark checkout found: set COREMARK_DIR to one with tools/probe.py")
+        sys.exit("no coremark checkout found: set COREMARK_DIR to one with "
+                 "tools/probe.py and tools/probe_parse.py")
     # Checked here because both halves of the coremark tooling need it -- the flash
     # path opens the bootrom with pyusb and the console reader does the same to the
     # application's port -- and the failure is a traceback from inside probe.py that
@@ -94,13 +126,7 @@ def main():
 
     # ---- build ------------------------------------------------------------
     if not args.keep:
-        cmd = ["cmake", "-S", HERE, "-B", build,
-               "-DPICO_BOARD=%s" % args.board,
-               "-DPICO_TURBO_DIR=%s" % args.pico_turbo,
-               "-DPICO_TURBO_SYS_CLK_KHZ=%d" % args.khz,
-               "-DEMBENCH_BENCHMARK=%s" % args.benchmark,
-               "-DGLOBAL_SCALE_FACTOR=%d" % args.scale]
-        rc, out = probe.run(cmd, timeout=300,
+        rc, out = probe.run(configure_cmd(args, HERE, build), timeout=300,
                             log_path=os.path.join(logs, "cmake.log"), env=env)
         if rc != 0:
             sys.exit("configure failed:\n" + out[-2000:])
@@ -149,29 +175,29 @@ def main():
         reader.terminate()
 
     text = open(rlog).read() if os.path.exists(rlog) else ""
-    state = re.search(r"^PICO-TURBO: (.*)$", text, re.M)
-    if state:
-        probe.log("    state: %s" % state.group(1))
-    emb = re.search(r"^EMBENCH: (.*)$", text, re.M)
-    if emb:
-        probe.log("    %s" % emb.group(1))
+    log = embench_log.parse_log(text)
+    if log.state:
+        probe.log("    state: %s" % embench_log.format_state(log.state))
+    if log.scale:
+        probe.log("    %s scale %d heat %d"
+                  % (log.scale.bench, log.scale.scale, log.scale.heat))
 
-    result = re.search(r"^EMBENCH-PICO: (\S+) (\d+) us (\w+)$", text, re.M)
-    if not result:
+    kind, code = outcome(log)
+    if log.result is None:
         addr, sym = dbg.pc(elf)
-        probe.log("    NO RESULT -- program counter %s %s"
-                  % (hex(addr) if addr else "?", sym or ""))
-        return 1
+        probe.log("    NO RESULT (%s) -- program counter %s %s"
+                  % (kind, hex(addr) if addr else "?", sym or ""))
+        return code
 
-    us = int(result.group(2))
-    probe.log("    %s: %d us, %s" % (result.group(1), us, result.group(3)))
-    json.dump({"benchmark": result.group(1), "us": us,
-               "verified": result.group(3) == "pass",
+    probe.log("    %s: %d us, %s"
+              % (log.result.bench, log.result.us, log.result.verdict))
+    json.dump({"benchmark": log.result.bench, "us": log.result.us,
+               "verified": log.result.verdict == "pass",
                "board": args.board, "khz": args.khz, "scale": args.scale,
                "toolchain": args.toolchain,
-               "state_line": state.group(1) if state else None},
+               "state_line": embench_log.format_state(log.state)},
               open(os.path.join(args.out, "result.json"), "w"), indent=1)
-    return 0 if result.group(3) == "pass" else 1
+    return code
 
 
 if __name__ == "__main__":
